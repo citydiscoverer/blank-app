@@ -1,156 +1,210 @@
-# Felix Abayomi – SPLG DCA Dashboard (single-file version)
+# Felix Abayomi – SPLG DCA (Supabase-persisted)
 import streamlit as st
 import pandas as pd
-from datetime import date
+import numpy as np
+from datetime import date, datetime
+from supabase import create_client, Client
 
 st.set_page_config(page_title="Felix DCA Dashboard", layout="wide")
-st.title("📈 Felix Abayomi – SPLG DCA Dashboard")
+st.title("📈 Felix Abayomi – SPLG DCA Dashboard (Cloud-saved)")
 
-st.caption(
-    "Log your daily buys, optionally add end-of-day **account value** from J.P. Morgan, "
-    "and track true P&L. Download/upload CSV anytime."
-)
+# --------- Supabase client ----------
+@st.cache_resource
+def get_sb() -> Client:
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["service_role_key"]  # server side only
+    return create_client(url, key)
 
-# ---------- helpers ----------
-CSV_COLS = ["date", "amount", "price", "eod_value"]
+sb = get_sb()
 
-def init_state():
-    if "df" not in st.session_state:
-        st.session_state.df = pd.DataFrame(columns=CSV_COLS)
+# --------- DB helpers ----------
+def load_buys_df() -> pd.DataFrame:
+    res = sb.table("buys").select("*").order("d").execute()
+    rows = res.data or []
+    if not rows: 
+        return pd.DataFrame(columns=["id","d","amount","price","created_at"])
+    df = pd.DataFrame(rows)
+    df["d"] = pd.to_datetime(df["d"]).dt.date
+    return df[["id","d","amount","price","created_at"]]
 
-def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    out["date"] = pd.to_datetime(out["date"]).dt.floor("D")
-    num_cols = ["amount", "price", "eod_value"]
-    for c in num_cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    out = out.sort_values("date").reset_index(drop=True)
-    return out
+def load_eod_df() -> pd.DataFrame:
+    res = sb.table("eod_values").select("*").order("d").execute()
+    rows = res.data or []
+    if not rows:
+        return pd.DataFrame(columns=["d","eod_value","updated_at"])
+    df = pd.DataFrame(rows)
+    df["d"] = pd.to_datetime(df["d"]).dt.date
+    return df[["d","eod_value","updated_at"]]
 
-def compute_metrics(df: pd.DataFrame, current_price: float) -> dict:
-    """Returns dict with calc tables and headline metrics.
-       If eod_value present for latest date, use it for value and P&L;
-       otherwise fall back to mark-to-market using current_price.
-    """
-    if df.empty:
-        return dict(df=df, calc=None, value=0.0, cost=0.0, pnl=0.0, pnl_pct=0.0)
+def add_buy(d: date, amount: float, price: float):
+    sb.table("buys").insert({"d": str(d), "amount": amount, "price": price}).execute()
 
-    calc = df.copy()
-    calc["shares"] = calc["amount"] / calc["price"]
-    calc["cum_shares"] = calc["shares"].cumsum()
-    calc["cum_invested"] = calc["amount"].cumsum()
+def delete_buys(ids: list[int]):
+    if ids:
+        sb.table("buys").delete().in_("id", ids).execute()
 
-    # Daily P&L using provided end-of-day account value (if present)
-    calc["daily_pnl"] = pd.NA
-    calc["value"] = pd.NA
+def upsert_eod(d: date, eod_value: float):
+    # upsert by primary key (d)
+    sb.table("eod_values").upsert({"d": str(d), "eod_value": eod_value}).execute()
 
-    prev_eod = 0.0
-    for i, row in calc.iterrows():
-        # account value: if user provided eod_value use it; else mark-to-market for that row
-        if pd.notna(row.get("eod_value")):
-            value_i = float(row["eod_value"])
-        else:
-            value_i = float(calc.loc[i, "cum_shares"] * current_price)
+def delete_eod(dates: list[date]):
+    if dates:
+        dates_str = [str(d) for d in dates]
+        sb.table("eod_values").delete().in_("d", dates_str).execute()
 
-        calc.loc[i, "value"] = value_i
+# --------- Calculations ----------
+def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame):
+    if buys.empty and eod.empty:
+        return pd.DataFrame(columns=[
+            "date","amount","price","shares","cum_shares","cum_invested",
+            "portfolio_value","daily_pnl","cum_pnl","ret%"
+        ])
 
-        # daily pnl = today's end value - (yesterday end value + today's new cash)
-        amt_today = float(row["amount"]) if pd.notna(row["amount"]) else 0.0
-        daily = value_i - (prev_eod + amt_today)
-        calc.loc[i, "daily_pnl"] = daily
-        prev_eod = value_i
+    # Aggregate buys by day
+    b = buys.copy()
+    if not b.empty:
+        b = (b.groupby("d", as_index=False)
+               .agg(amount=("amount","sum"), price=("price","mean")))
+        b["shares"] = b["amount"] / b["price"]
+    else:
+        b = pd.DataFrame(columns=["d","amount","price","shares"])
 
-    cost_basis = float(calc["cum_invested"].iloc[-1])
-    portfolio_value = float(calc["value"].iloc[-1])
-    pnl_abs = portfolio_value - cost_basis
-    pnl_pct = (pnl_abs / cost_basis * 100.0) if cost_basis else 0.0
+    # Join EOD values
+    e = eod.copy().rename(columns={"d":"d", "eod_value":"eod_value"})
 
-    return dict(
-        df=df, calc=calc, value=portfolio_value, cost=cost_basis, pnl=pnl_abs, pnl_pct=pnl_pct
-    )
+    # Build continuous timeline from min date to today
+    dates = []
+    if not b.empty: dates.append(min(b["d"]))
+    if not e.empty: dates.append(min(e["d"]))
+    if not dates:
+        start = date.today()
+    else:
+        start = min(dates)
+    end = date.today()
+    timeline = pd.DataFrame({"d": pd.date_range(start, end, freq="D").date})
 
-# ---------- UI ----------
-init_state()
+    # Merge buys and eod to timeline
+    t = timeline.merge(b, how="left", left_on="d", right_on="d")
+    t = t.merge(e, how="left", left_on="d", right_on="d")
+    t[["amount","price","shares","eod_value"]] = t[["amount","price","shares","eod_value"]].fillna(0.0)
 
+    # Cumulated contributions and shares
+    t["cum_invested"] = t["amount"].cumsum()
+    t["cum_shares"] = t["shares"].cumsum()
+
+    # Portfolio value: prefer broker EOD if present (>0), else estimate using that day's average price if any,
+    # or last nonzero price (carry forward estimate)
+    # For simplicity, use latest known average buy price as proxy if no EOD:
+    # We'll create a rolling proxy price = last non-zero 'price' seen.
+    t["proxy_price"] = t["price"].replace(0, np.nan).ffill().fillna(method="bfill").fillna(1.0)
+    t["est_value"] = (t["cum_shares"] * t["proxy_price"]).round(2)
+    t["portfolio_value"] = np.where(t["eod_value"] > 0, t["eod_value"], t["est_value"])
+
+    # Daily P&L = value change – new contributions
+    t["value_change"] = t["portfolio_value"].diff()
+    t.loc[t.index[0], "value_change"] = 0.0
+    t["daily_pnl"] = (t["value_change"] - t["amount"]).round(2)
+
+    # Cumulative P&L
+    t["cum_pnl"] = (t["portfolio_value"] - t["cum_invested"]).round(2)
+    t["ret%"] = np.where(t["cum_invested"]>0, (t["cum_pnl"]/t["cum_invested"]*100).round(2), 0.0)
+
+    # Pretty output
+    out = t.rename(columns={"d":"date"})
+    out["shares"] = out["shares"].round(6)
+    out["cum_shares"] = out["cum_shares"].round(6)
+    keep = ["date","amount","price","shares","cum_shares","cum_invested",
+            "portfolio_value","daily_pnl","cum_pnl","ret%"]
+    return out[keep]
+
+# --------- UI: Data entry ----------
 with st.sidebar:
-    st.header("📦 Data & Settings")
-    up = st.file_uploader("Upload CSV (columns: date,amount,price,eod_value)", type="csv")
-    if up is not None:
-        tmp = pd.read_csv(up)
-        st.session_state.df = clean_df(tmp)
-        st.success("Loaded CSV.")
+    st.header("☁️ Cloud Save: Supabase")
+    st.caption("Your data auto-saves to Supabase. Nothing is lost on refresh.")
 
-    if not st.session_state.df.empty:
-        dl = st.session_state.df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download CSV", dl, file_name="felix_dca_log.csv", mime="text/csv")
+# Load current data
+buys_df = load_buys_df()
+eod_df = load_eod_df()
 
-    if st.button("🧹 Clear ALL data", type="secondary"):
-        st.session_state.df = pd.DataFrame(columns=CSV_COLS)
-        st.experimental_rerun()
-
-# add a buy
 st.subheader("1) Add a buy")
-c1, c2, c3 = st.columns([1,1,1])
+c1,c2,c3,c4 = st.columns([1.2,1,1,0.8])
 with c1:
     d_in = st.date_input("Date", value=date.today())
 with c2:
     amt = st.number_input("Amount ($)", min_value=0.0, value=25.0, step=1.0)
 with c3:
     px = st.number_input("Execution price ($/share)", min_value=0.0, value=75.00, step=0.01)
+with c4:
+    if st.button("➕ Add buy", use_container_width=True, type="primary"):
+        add_buy(d_in, float(amt), float(px))
+        st.success("Buy saved to cloud.")
+        st.rerun()
 
-# optional end-of-day account value for **that same date**
-eod = st.number_input(
-    "Optional: End-of-day account value (from J.P. Morgan) for this date", min_value=0.0, value=0.0, step=0.01
-)
+st.subheader("2) Add broker end-of-day (EOD) value")
+e1,e2 = st.columns([1.2,1])
+with e1:
+    d_eod = st.date_input("EOD date", value=date.today(), key="eod_date")
+with e2:
+    v_eod = st.number_input("EOD account value ($)", min_value=0.0, value=0.0, step=0.01)
+if st.button("💾 Save EOD value"):
+    if v_eod <= 0:
+        st.warning("Enter the exact value from J.P. Morgan (e.g., 24.90, 50.11).")
+    else:
+        upsert_eod(d_eod, float(v_eod))
+        st.success("EOD value saved to cloud.")
+        st.rerun()
 
-if st.button("➕ Add entry"):
-    new = pd.DataFrame([{
-        "date": pd.to_datetime(d_in),
-        "amount": float(amt),
-        "price": float(px),
-        "eod_value": float(eod) if eod > 0 else pd.NA
-    }])
-    st.session_state.df = clean_df(pd.concat([st.session_state.df, new], ignore_index=True))
-    st.success("Added entry.")
+# --------- Manage entries ----------
+st.subheader("3) Manage entries")
+colL, colR = st.columns(2)
+with colL:
+    st.markdown("**Buys**")
+    if buys_df.empty:
+        st.info("No buys yet.")
+    else:
+        st.dataframe(buys_df, use_container_width=True)
+        ids = st.multiselect("Delete buys by ID", buys_df["id"].tolist())
+        if st.button("🗑 Delete selected buys"):
+            delete_buys(ids)
+            st.success("Deleted.")
+            st.rerun()
 
-# manage entries (delete)
-st.subheader("2) Manage entries")
-df_show = st.session_state.df.copy()
-st.dataframe(df_show, use_container_width=True, hide_index=True)
-if not df_show.empty:
-    idxs = st.multiselect("Select rows to delete", options=df_show.index.tolist(), format_func=lambda i: str(df_show.loc[i,"date"].date()))
-    if st.button("🗑️ Delete selected") and idxs:
-        st.session_state.df = df_show.drop(index=idxs).reset_index(drop=True)
-        st.success("Deleted.")
-        st.experimental_rerun()
+with colR:
+    st.markdown("**EOD values**")
+    if eod_df.empty:
+        st.info("No EOD values yet.")
+    else:
+        st.dataframe(eod_df, use_container_width=True)
+        sel_dates = st.multiselect("Delete EOD rows (by date)", [r for r in eod_df["d"]])
+        if st.button("🗑 Delete selected EOD"):
+            delete_eod(sel_dates)
+            st.success("Deleted.")
+            st.rerun()
 
-# portfolio metrics
-st.subheader("3) Portfolio metrics & charts")
-cur_price = st.number_input("If no EOD value provided, use this current SPLG price ($):", value=75.00, step=0.01)
-res = compute_metrics(st.session_state.df, current_price=cur_price)
+# --------- Metrics & Charts ----------
+st.subheader("4) Portfolio metrics & charts")
+daily = compute_daily(buys_df, eod_df)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Cost basis", f"${res['cost']:,.2f}")
-c2.metric("Shares", f"{(res['calc']['cum_shares'].iloc[-1] if res['calc'] is not None else 0):.4f}")
-c3.metric("Portfolio value", f"${res['value']:,.2f}")
-trend = "↑" if res["pnl"] >= 0 else "↓"
-c4.metric("Cumulative P&L", f"${res['pnl']:,.2f}", f"{res['pnl_pct']:.2f}%")
-
-# charts
-if res["calc"] is not None and not res["calc"].empty:
-    left, right = st.columns(2)
-    with left:
-        st.write("**Portfolio value over time**")
-        st.line_chart(res["calc"][["date","value"]].set_index("date"))
-    with right:
-        st.write("**Daily gain/loss ($)**")
-        st.bar_chart(res["calc"][["date","daily_pnl"]].set_index("date"))
-
-    st.write("**Detail (last 30 days)**")
-    tail_cols = ["date","amount","price","eod_value","shares","cum_shares","cum_invested","value","daily_pnl"]
-    st.dataframe(res["calc"][tail_cols].tail(30).reset_index(drop=True), use_container_width=True)
+if daily.empty:
+    st.info("Add a buy to see analytics.")
 else:
-    st.info("No entries yet.")
+    latest = daily.iloc[-1]
+    m1,m2,m3,m4,m5 = st.columns(5)
+    m1.metric("Cost basis", f"${latest['cum_invested']:,.2f}")
+    m2.metric("Shares", f"{latest['cum_shares']:.6f}")
+    m3.metric("Portfolio value", f"${latest['portfolio_value']:,.2f}")
+    m4.metric("Cumulative P&L", f"${latest['cum_pnl']:,.2f}")
+    m5.metric("Return", f"{latest['ret%']:.2f}%")
+
+    c1,c2 = st.columns(2)
+    with c1:
+        st.markdown("**Portfolio value over time**")
+        st.line_chart(daily.set_index("date")[["portfolio_value"]])
+    with c2:
+        st.markdown("**Daily P&L ($)**")
+        st.bar_chart(daily.set_index("date")[["daily_pnl"]])
+
+    st.markdown("**Last 30 days**")
+    view = daily.tail(30).copy()
+    view["date"] = view["date"].astype(str)
+    st.dataframe(view, use_container_width=True)
