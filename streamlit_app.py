@@ -1,5 +1,4 @@
-# Felix Abayomi – DCA Dashboard (Supabase + Multi-Ticker, Stable + Correct P&L)
-import streamlit as st
+st.set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
 import pandas as pd
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -22,14 +21,14 @@ def get_supabase():
 
     try:
         url = st.secrets["supabase"]["url"]
-        key = st.secrets["supabase"]["key"]
+        key = st.secrets["supabase"]["service_role_key"]  # <-- use service_role_key
         return create_client(url, key)
-    except Exception as e:
-        st.error("Supabase secrets missing or invalid. Add them in Settings → Secrets.")
-        st.caption(f"Error: {e}")
+    except KeyError:
+        st.error('Supabase secrets missing. Add in Secrets:\n[supabase]\nurl="..."\nservice_role_key="..."')
         return None
-
-sb = get_supabase()
+    except Exception as e:
+        st.error(f"Supabase init error: {e}")
+        return None
 
 # ---------- DB helpers ----------
 BUYS_TABLE = "buys"   # schema: id uuid/bigint, ticker text, date date, amount numeric, price numeric
