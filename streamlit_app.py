@@ -1,6 +1,8 @@
 # Felix Abayomi – DCA Dashboard (Supabase + Multi-Ticker, Stable + Correct P&L)
+
+import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 # ---------- Precision / rounding ----------
@@ -21,7 +23,7 @@ def get_supabase():
 
     try:
         url = st.secrets["supabase"]["url"]
-        key = st.secrets["supabase"]["service_role_key"]  # <-- use service_role_key
+        key = st.secrets["supabase"]["service_role_key"]  # <-- use service_role_key (be mindful of security!)
         return create_client(url, key)
     except KeyError:
         st.error('Supabase secrets missing. Add in Secrets:\n[supabase]\nurl="..."\nservice_role_key="..."')
@@ -30,19 +32,25 @@ def get_supabase():
         st.error(f"Supabase init error: {e}")
         return None
 
+# create global client for helpers
+sb = get_supabase()
+
 # ---------- DB helpers ----------
 BUYS_TABLE = "buys"   # schema: id uuid/bigint, ticker text, date date, amount numeric, price numeric
 # Recommended column precisions in Supabase (run once in SQL editor):
 #  amount numeric(14,2), price numeric(14,6), shares numeric(20,8)
 
 def list_tickers():
-    if not sb: return []
+    if not sb: 
+        return []
     res = sb.table(BUYS_TABLE).select("ticker").execute()
-    if not res.data: return []
+    if not res.data: 
+        return []
     return sorted({row["ticker"] for row in res.data})
 
 def load_buys(ticker: str | None):
-    if not sb: return pd.DataFrame()
+    if not sb: 
+        return pd.DataFrame()
     query = sb.table(BUYS_TABLE).select("*")
     if ticker:
         query = query.eq("ticker", ticker)
@@ -51,12 +59,13 @@ def load_buys(ticker: str | None):
     if not df.empty:
         # ensure types
         df["date"] = pd.to_datetime(df["date"]).dt.date
-        df["amount"] = df["amount"].astype(float)
-        df["price"]  = df["price"].astype(float)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+        df["price"]  = pd.to_numeric(df["price"], errors="coerce").fillna(0.0)
     return df
 
 def insert_buy(ticker: str, d: date, amount: Decimal, price: Decimal):
-    if not sb: return
+    if not sb: 
+        return
     row = {
         "ticker": ticker.upper().strip(),
         "date":   d.isoformat(),
@@ -66,31 +75,41 @@ def insert_buy(ticker: str, d: date, amount: Decimal, price: Decimal):
     sb.table(BUYS_TABLE).insert(row).execute()
 
 def delete_ids(ids: list[str|int]):
-    if not sb or not ids: return
+    if not sb or not ids: 
+        return
     sb.table(BUYS_TABLE).delete().in_("id", ids).execute()
 
 def clear_ticker(ticker: str):
-    if not sb: return
+    if not sb: 
+        return
     sb.table(BUYS_TABLE).delete().eq("ticker", ticker).execute()
 
 # ---------- math helpers ----------
+def _empty_lots_df():
+    return pd.DataFrame(columns=[
+        "id","ticker","date","amount","price",
+        "amountD","priceD","shares_lotD","cum_sharesD","cum_investedD",
+        "shares_lot","cum_shares","cum_invested"
+    ])
+
 def compute_lots(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns df with Decimal-based, broker-like rounding per lot and cumulative totals.
     """
     if df.empty:
-        return df.assign(shares_lot=[], cum_shares=[], cum_invested=[], portfolio_value=[], daily_market_move=[])
+        return _empty_lots_df()
 
     tmp = df.copy().sort_values("date")
     tmp["amountD"] = tmp["amount"].apply(D)
     tmp["priceD"]  = tmp["price"].apply(D)
 
-    # per-lot shares rounded to 5 dp
-    tmp["shares_lotD"] = (tmp["amountD"] / tmp["priceD"]).apply(lambda s: s.quantize(SHARE_Q, ROUND_HALF_UP))
-    tmp["cum_sharesD"] = tmp["shares_lotD"].cumsum()
+    # avoid division by zero just in case
+    tmp["shares_lotD"] = (tmp["amountD"] / tmp["priceD"].replace(Decimal("0"), Decimal("1"))).apply(
+        lambda s: s.quantize(SHARE_Q, ROUND_HALF_UP)
+    )
+    tmp["cum_sharesD"]   = tmp["shares_lotD"].cumsum()
     tmp["cum_investedD"] = tmp["amountD"].cumsum()
 
-    # return numeric versions for display plus Decimal columns for exact math
     out = tmp.copy()
     out["shares_lot"]   = out["shares_lotD"].astype(float)
     out["cum_shares"]   = out["cum_sharesD"].astype(float)
@@ -109,7 +128,7 @@ def calc_metrics(df_lots: pd.DataFrame, current_price: Decimal):
             "value": Decimal("0"),
             "cum_pnl": Decimal("0"),
             "ret_pct": Decimal("0"),
-            "series": pd.DataFrame(),
+            "series": pd.DataFrame(columns=["date","portfolio_value","daily_market_move"]),
         }
 
     shares_total = df_lots["cum_sharesD"].iloc[-1]
@@ -126,7 +145,9 @@ def calc_metrics(df_lots: pd.DataFrame, current_price: Decimal):
 
     # Daily market move (exclude new contributions): V_t - (V_{t-1} + amount_t)
     ser["prev_valueD"] = ser["portfolio_valueD"].shift(1).fillna(Decimal("0"))
-    ser["daily_market_moveD"] = (ser["portfolio_valueD"] - (ser["prev_valueD"] + ser["amountD"])).apply(lambda x: x.quantize(CENT, ROUND_HALF_UP))
+    ser["daily_market_moveD"] = (ser["portfolio_valueD"] - (ser["prev_valueD"] + ser["amountD"])).apply(
+        lambda x: x.quantize(CENT, ROUND_HALF_UP)
+    )
 
     ser_out = ser.copy()
     ser_out["portfolio_value"] = ser_out["portfolio_valueD"].astype(float)
@@ -145,10 +166,14 @@ def summarize_positions(all_buys: pd.DataFrame, price_map: dict[str, Decimal]) -
     """
     One row per ticker with cost basis, shares (sum of lot-rounded), live value, P&L.
     """
+    if all_buys.empty:
+        return pd.DataFrame(columns=["ticker","cost_basis","shares","price","value","pnl","ret_pct"])
+
     rows = []
     for tkr, grp in all_buys.groupby("ticker"):
         lots = compute_lots(grp)
-        price = price_map.get(tkr, D(grp["price"].iloc[-1]))
+        last_price_in_grp = D(grp["price"].iloc[-1]) if not grp.empty else D("0")
+        price = price_map.get(tkr, last_price_in_grp)
         met = calc_metrics(lots, price)
         rows.append({
             "ticker": tkr,
@@ -177,7 +202,8 @@ with st.sidebar:
         st.error("Not connected")
     existing = list_tickers()
     def_val = "SPLG" if "SPLG" in existing or not existing else existing[0]
-    ticker = st.selectbox("Ticker", options=sorted(set(existing + ["SPLG","SCHD","VOO","SPY"])), index=sorted(set(existing + ["SPLG","SCHD","VOO","SPY"])).index(def_val))
+    ticker_options = sorted(set(existing + ["SPLG","SCHD","VOO","SPY"]))
+    ticker = st.selectbox("Ticker", options=ticker_options, index=ticker_options.index(def_val))
     colR = st.columns(2)
     with colR[0]:
         if st.button("🔄 Refresh data", use_container_width=True):
@@ -217,11 +243,15 @@ if df.empty:
 else:
     # Show table with ability to select & delete
     df_disp = df.copy()
-    df_disp["shares (lot)"] = (df_disp["amount"] / df_disp["price"]).round(5)
+    df_disp["shares (lot)"] = (df_disp["amount"] / df_disp["price"]).round(5).fillna(0.0)
     df_disp = df_disp[["id","date","amount","price","shares (lot)"]]
     df_disp = df_disp.rename(columns={"id":"_id"})
     st.dataframe(df_disp.drop(columns=["_id"]), use_container_width=True, hide_index=True)
-    ids = st.multiselect("Select rows to delete", options=df_disp["_id"].tolist(), format_func=lambda x: f"Row #{df_disp.index[df_disp['_id']==x][0]+1}")
+    ids = st.multiselect(
+        "Select rows to delete",
+        options=df_disp["_id"].tolist(),
+        format_func=lambda x: f"Row #{df_disp.index[df_disp['_id']==x][0]+1}"
+    )
     del_cols = st.columns([1,3,1,1])
     with del_cols[3]:
         if st.button("🗑️ Delete selected"):
@@ -232,7 +262,7 @@ else:
 # Current price input (per ticker)
 st.divider()
 st.markdown(f"### 3) Current price — {ticker}")
-default_px = df["price"].iloc[-1] if not df.empty else 75.0
+default_px = float(df["price"].iloc[-1]) if not df.empty else 75.0
 cur_price = D(st.number_input(f"Current price for {ticker} ($)", value=float(default_px), step=0.01))
 
 # Metrics & charts using precise math
@@ -265,7 +295,7 @@ if not metrics["series"].empty:
         )
 
 st.markdown("#### Last 30 days")
-if not lots.empty:
+if not lots.empty and not metrics["series"].empty:
     recent = metrics["series"].merge(
         lots[["date","amount","price","shares_lot","cum_shares","cum_invested"]],
         on="date",
