@@ -1,268 +1,319 @@
 # Felix Abayomi – DCA Dashboard (Supabase + Multi-Ticker, Stable + Correct P&L)
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import date
-from supabase import create_client, Client
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 
-st.set_page_config(page_title="Felix DCA (Cloud-saved)", layout="wide")
-st.title("📈 Felix Abayomi – DCA Dashboard (Cloud-saved)")
+# ---------- Precision / rounding ----------
+getcontext().prec = 28
+SHARE_Q = Decimal("0.00001")  # broker-like 5-decimal shares
+CENT    = Decimal("0.01")
+def D(x):  # safe Decimal
+    return Decimal(str(x)) if x is not None and str(x) != "" else Decimal("0")
 
-# --------------------- CONFIG ---------------------
-TICKERS = ["SPLG", "SCHD", "QQQM", "VOO", "SPY"]
-
-# ------------------ SUPABASE CLIENT ----------------
-@st.cache_resource
-def get_sb() -> Client | None:
+# ---------- Supabase client ----------
+@st.cache_resource(show_spinner=False)
+def get_supabase():
     try:
-        url = st.secrets["supabase"]["url"]
-        key = st.secrets["supabase"]["service_role_key"]
-        return create_client(url, key)
+        from supabase import create_client
     except Exception:
-        st.error("❌ Supabase secrets not found. Add them in Settings → Secrets.")
+        st.error("Supabase client not installed. Add `supabase` to requirements.txt.")
         return None
 
-sb = get_sb()
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error("Supabase secrets missing or invalid. Add them in Settings → Secrets.")
+        st.caption(f"Error: {e}")
+        return None
 
-# ------------------ DB HELPERS ---------------------
-def load_buys(ticker: str) -> pd.DataFrame:
-    if sb is None:
-        return pd.DataFrame(columns=["id","d","amount","price","created_at","ticker"])
-    res = sb.table("buys").select("*").eq("ticker", ticker).order("d").execute()
-    rows = res.data or []
-    if not rows:
-        return pd.DataFrame(columns=["id","d","amount","price","created_at","ticker"])
-    df = pd.DataFrame(rows)
-    df["d"] = pd.to_datetime(df["d"]).dt.date
-    return df[["id","d","amount","price","created_at","ticker"]]
+sb = get_supabase()
 
-def load_eod(ticker: str) -> pd.DataFrame:
-    if sb is None:
-        return pd.DataFrame(columns=["ticker","d","eod_value","updated_at"])
-    res = sb.table("eod_values").select("*").eq("ticker", ticker).order("d").execute()
-    rows = res.data or []
-    if not rows:
-        return pd.DataFrame(columns=["ticker","d","eod_value","updated_at"])
-    df = pd.DataFrame(rows)
-    df["d"] = pd.to_datetime(df["d"]).dt.date
-    return df[["ticker","d","eod_value","updated_at"]]
+# ---------- DB helpers ----------
+BUYS_TABLE = "buys"   # schema: id uuid/bigint, ticker text, date date, amount numeric, price numeric
+# Recommended column precisions in Supabase (run once in SQL editor):
+#  amount numeric(14,2), price numeric(14,6), shares numeric(20,8)
 
-def add_buy(ticker: str, d: date, amount: float, price: float):
-    if sb is None: return
-    sb.table("buys").insert({"ticker": ticker, "d": str(d), "amount": amount, "price": price}).execute()
+def list_tickers():
+    if not sb: return []
+    res = sb.table(BUYS_TABLE).select("ticker").execute()
+    if not res.data: return []
+    return sorted({row["ticker"] for row in res.data})
 
-def delete_buys(ids: list[int]):
-    if sb is None or not ids: return
-    sb.table("buys").delete().in_("id", ids).execute()
+def load_buys(ticker: str | None):
+    if not sb: return pd.DataFrame()
+    query = sb.table(BUYS_TABLE).select("*")
+    if ticker:
+        query = query.eq("ticker", ticker)
+    res = query.order("date", desc=False).execute()
+    df = pd.DataFrame(res.data or [])
+    if not df.empty:
+        # ensure types
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["amount"] = df["amount"].astype(float)
+        df["price"]  = df["price"].astype(float)
+    return df
 
-def upsert_eod(ticker: str, d: date, eod_value: float):
-    if sb is None: return
-    sb.table("eod_values").upsert({"ticker": ticker, "d": str(d), "eod_value": eod_value}).execute()
+def insert_buy(ticker: str, d: date, amount: Decimal, price: Decimal):
+    if not sb: return
+    row = {
+        "ticker": ticker.upper().strip(),
+        "date":   d.isoformat(),
+        "amount": float(amount),
+        "price":  float(price),
+    }
+    sb.table(BUYS_TABLE).insert(row).execute()
 
-def delete_eod(ticker: str, dates: list[date]):
-    if sb is None or not dates: return
-    sb.table("eod_values").delete().eq("ticker", ticker).in_("d", [str(d) for d in dates]).execute()
+def delete_ids(ids: list[str|int]):
+    if not sb or not ids: return
+    sb.table(BUYS_TABLE).delete().in_("id", ids).execute()
 
 def clear_ticker(ticker: str):
-    if sb is None: return
-    sb.table("buys").delete().eq("ticker", ticker).execute()
-    sb.table("eod_values").delete().eq("ticker", ticker).execute()
+    if not sb: return
+    sb.table(BUYS_TABLE).delete().eq("ticker", ticker).execute()
 
-# --------------- CALCULATIONS (PATCHED) -------------
-def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame) -> pd.DataFrame:
+# ---------- math helpers ----------
+def compute_lots(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns a daily table with:
-      date, amount, price, shares, cum_shares, cum_invested,
-      portfolio_value, daily_pnl, cum_pnl, ret%
-    Rules:
-      - shares = amount / price (0 if price is 0)
-      - value uses broker EOD if provided; else estimate = cum_shares * proxy_price
-      - daily P&L = Δ(value) − amount_today (market move only), first day = 0
+    Returns df with Decimal-based, broker-like rounding per lot and cumulative totals.
     """
-    if buys.empty and eod.empty:
-        return pd.DataFrame(columns=[
-            "date","amount","price","shares","cum_shares","cum_invested",
-            "portfolio_value","daily_pnl","cum_pnl","ret%"
-        ])
+    if df.empty:
+        return df.assign(shares_lot=[], cum_shares=[], cum_invested=[], portfolio_value=[], daily_market_move=[])
 
-    if not buys.empty:
-        b = (buys.groupby("d", as_index=False)
-                 .agg(amount=("amount","sum"), price=("price","mean")))
-        b["shares"] = np.where(b["price"] > 0, b["amount"]/b["price"], 0.0)
+    tmp = df.copy().sort_values("date")
+    tmp["amountD"] = tmp["amount"].apply(D)
+    tmp["priceD"]  = tmp["price"].apply(D)
+
+    # per-lot shares rounded to 5 dp
+    tmp["shares_lotD"] = (tmp["amountD"] / tmp["priceD"]).apply(lambda s: s.quantize(SHARE_Q, ROUND_HALF_UP))
+    tmp["cum_sharesD"] = tmp["shares_lotD"].cumsum()
+    tmp["cum_investedD"] = tmp["amountD"].cumsum()
+
+    # return numeric versions for display plus Decimal columns for exact math
+    out = tmp.copy()
+    out["shares_lot"]   = out["shares_lotD"].astype(float)
+    out["cum_shares"]   = out["cum_sharesD"].astype(float)
+    out["cum_invested"] = out["cum_investedD"].astype(float)
+    return out
+
+def calc_metrics(df_lots: pd.DataFrame, current_price: Decimal):
+    """
+    Uses Decimal math. Returns dict with cost_basis, shares, value, cum_pnl, ret_pct,
+    plus a DataFrame with portfolio_value + daily market move.
+    """
+    if df_lots.empty:
+        return {
+            "cost_basis": Decimal("0"),
+            "shares": Decimal("0"),
+            "value": Decimal("0"),
+            "cum_pnl": Decimal("0"),
+            "ret_pct": Decimal("0"),
+            "series": pd.DataFrame(),
+        }
+
+    shares_total = df_lots["cum_sharesD"].iloc[-1]
+    cost_basis   = df_lots["cum_investedD"].iloc[-1]
+
+    # portfolio value at current price
+    pv_today = (shares_total * current_price).quantize(CENT, ROUND_HALF_UP)
+    cum_pnl  = (pv_today - cost_basis).quantize(CENT, ROUND_HALF_UP)
+    ret_pct  = (cum_pnl / cost_basis * Decimal("100")).quantize(Decimal("0.01"), ROUND_HALF_UP) if cost_basis > 0 else Decimal("0.00")
+
+    # Series for chart: value each day at *today’s* price
+    ser = df_lots[["date", "cum_sharesD", "amountD"]].copy()
+    ser["portfolio_valueD"] = ser["cum_sharesD"].apply(lambda s: (s * current_price).quantize(CENT, ROUND_HALF_UP))
+
+    # Daily market move (exclude new contributions): V_t - (V_{t-1} + amount_t)
+    ser["prev_valueD"] = ser["portfolio_valueD"].shift(1).fillna(Decimal("0"))
+    ser["daily_market_moveD"] = (ser["portfolio_valueD"] - (ser["prev_valueD"] + ser["amountD"])).apply(lambda x: x.quantize(CENT, ROUND_HALF_UP))
+
+    ser_out = ser.copy()
+    ser_out["portfolio_value"] = ser_out["portfolio_valueD"].astype(float)
+    ser_out["daily_market_move"] = ser_out["daily_market_moveD"].astype(float)
+
+    return {
+        "cost_basis": cost_basis,
+        "shares": shares_total,
+        "value": pv_today,
+        "cum_pnl": cum_pnl,
+        "ret_pct": ret_pct,
+        "series": ser_out[["date", "portfolio_value", "daily_market_move"]],
+    }
+
+def summarize_positions(all_buys: pd.DataFrame, price_map: dict[str, Decimal]) -> pd.DataFrame:
+    """
+    One row per ticker with cost basis, shares (sum of lot-rounded), live value, P&L.
+    """
+    rows = []
+    for tkr, grp in all_buys.groupby("ticker"):
+        lots = compute_lots(grp)
+        price = price_map.get(tkr, D(grp["price"].iloc[-1]))
+        met = calc_metrics(lots, price)
+        rows.append({
+            "ticker": tkr,
+            "cost_basis": float(met["cost_basis"]),
+            "shares": float(met["shares"]),
+            "price": float(price),
+            "value": float(met["value"]),
+            "pnl": float(met["cum_pnl"]),
+            "ret_pct": float(met["ret_pct"]),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["ret_pct"] = df["ret_pct"].round(2)
+    return df.sort_values("ticker")
+
+# ---------- UI ----------
+st.set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
+st.title("📈 Felix Abayomi – Multi-Ticker DCA Dashboard")
+
+with st.sidebar:
+    st.subheader("☁️ Cloud Save: Supabase")
+    if sb:
+        st.success("Connected")
     else:
-        b = pd.DataFrame(columns=["d","amount","price","shares"])
+        st.error("Not connected")
+    existing = list_tickers()
+    def_val = "SPLG" if "SPLG" in existing or not existing else existing[0]
+    ticker = st.selectbox("Ticker", options=sorted(set(existing + ["SPLG","SCHD","VOO","SPY"])), index=sorted(set(existing + ["SPLG","SCHD","VOO","SPY"])).index(def_val))
+    colR = st.columns(2)
+    with colR[0]:
+        if st.button("🔄 Refresh data", use_container_width=True):
+            st.experimental_rerun()
+    with colR[1]:
+        if st.button("🧹 Clear THIS ticker", type="secondary", use_container_width=True):
+            if sb:
+                clear_ticker(ticker)
+                st.success(f"Cleared {ticker}")
+                st.experimental_rerun()
 
-    e = eod.copy()[["d","eod_value"]] if not eod.empty else pd.DataFrame(columns=["d","eod_value"])
-
-    starts = []
-    if not b.empty: starts.append(min(b["d"]))
-    if not e.empty: starts.append(min(e["d"]))
-    start = min(starts) if starts else date.today()
-    end   = date.today()
-    t = pd.DataFrame({"d": pd.date_range(start, end, freq="D").date})
-
-    t = t.merge(b, how="left", on="d")
-    t = t.merge(e, how="left", on="d")
-    for col in ["amount","price","shares","eod_value"]:
-        if col in t.columns:
-            t[col] = t[col].fillna(0.0)
+st.markdown("### 1) Add a buy")
+c1, c2, c3, c4 = st.columns([1.2,1,1,1.2])
+with c1:
+    d = st.date_input("Date", value=date.today())
+with c2:
+    amt = D(st.number_input("Amount ($)", value=25.00, min_value=0.0, step=1.0))
+with c3:
+    px  = D(st.number_input("Execution price ($/share)", value=75.00, min_value=0.0, step=0.01))
+with c4:
+    st.write(" ")
+    if st.button("➕ Add entry", use_container_width=True):
+        if sb:
+            insert_buy(ticker, d, amt, px)
+            st.success("Added.")
+            st.experimental_rerun()
         else:
-            t[col] = 0.0
+            st.error("Supabase not connected.")
 
-    t["cum_invested"] = t["amount"].cumsum().round(2)
-    t["cum_shares"]   = t["shares"].cumsum().round(6)
+# Load current ticker data
+df = load_buys(ticker)
 
-    t["proxy_price"]     = t["price"].replace(0, np.nan).ffill().bfill().fillna(1.0)
-    t["est_value"]       = (t["cum_shares"] * t["proxy_price"]).round(2)
-    t["portfolio_value"] = np.where(t["eod_value"] > 0, t["eod_value"], t["est_value"])
-
-    t["value_change"] = t["portfolio_value"].diff()
-    t.loc[t.index[0], "value_change"] = 0.0
-    t["daily_pnl"] = (t["value_change"] - t["amount"]).round(2)
-
-    t["cum_pnl"] = (t["portfolio_value"] - t["cum_invested"]).round(2)
-    t["ret%"]    = np.where(t["cum_invested"] > 0,
-                            (t["cum_pnl"]/t["cum_invested"]*100).round(2),
-                            0.0)
-
-    t["amount"]          = t["amount"].round(2)
-    t["price"]           = t["price"].round(4)
-    t["shares"]          = t["shares"].round(6)
-    t["portfolio_value"] = t["portfolio_value"].round(2)
-
-    out = t.rename(columns={"d":"date"})
-    return out[["date","amount","price","shares","cum_shares","cum_invested",
-                "portfolio_value","daily_pnl","cum_pnl","ret%"]]
-
-# ------------------- SIDEBAR ------------------------
-st.sidebar.header("☁️ Cloud Save: Supabase")
-ticker = st.sidebar.selectbox("Ticker", TICKERS, index=0)
-
-col_sb1, col_sb2 = st.sidebar.columns(2)
-with col_sb1:
-    if st.button("🔄 Refresh data"):
-        st.rerun()
-with col_sb2:
-    if st.button("🧹 Clear THIS ticker"):
-        clear_ticker(ticker)
-        st.success(f"Cleared all data for {ticker}.")
-        st.rerun()
-
-# ---------------- LOAD DATA ONCE --------------------
-buys_df = load_buys(ticker)
-eod_df  = load_eod(ticker)
-
-# ------------------ ADD BUY (FORM) -----------------
-st.subheader(f"1) Add a buy for {ticker}")
-with st.form("add_buy_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.2, 1, 1])
-    with c1:
-        d_in = st.date_input("Date", value=date.today())
-    with c2:
-        amt  = st.number_input("Amount ($)", min_value=0.0, value=25.0, step=1.0)
-    with c3:
-        px   = st.number_input("Execution price ($/share)", min_value=0.0, value=75.00, step=0.01)
-    submitted = st.form_submit_button("➕ Save buy", use_container_width=True)
-    if submitted:
-        add_buy(ticker, d_in, float(amt), float(px))
-        st.success("Buy saved to cloud.")
-        st.rerun()
-
-# ------------------ ADD EOD (FORM) -----------------
-st.subheader(f"2) Add broker end-of-day (EOD) value for {ticker}")
-with st.form("add_eod_form", clear_on_submit=True):
-    e1, e2 = st.columns([1.2, 1])
-    with e1:
-        d_eod = st.date_input("EOD date", value=date.today())
-    with e2:
-        v_eod = st.number_input("EOD account value ($)", min_value=0.0, value=0.0, step=0.01)
-    submitted_eod = st.form_submit_button("💾 Save EOD value", use_container_width=True)
-    if submitted_eod:
-        if v_eod <= 0:
-            st.warning("Enter the exact EOD value from your brokerage (e.g., 24.90, 50.11).")
-        else:
-            upsert_eod(ticker, d_eod, float(v_eod))
-            st.success("EOD saved to cloud.")
-            st.rerun()
-
-# ------------------ MANAGE ENTRIES -----------------
-st.subheader("3) Manage entries")
-colL, colR = st.columns(2)
-with colL:
-    st.markdown("**Buys (cloud)**")
-    if buys_df.empty:
-        st.info("No buys yet.")
-    else:
-        st.dataframe(buys_df, use_container_width=True)
-        ids = st.multiselect("Delete buys by ID", buys_df["id"].tolist())
-        if st.button("🗑 Delete selected buys"):
-            delete_buys(ids)
-            st.success("Deleted.")
-            st.rerun()
-
-with colR:
-    st.markdown("**EOD values (cloud)**")
-    if eod_df.empty:
-        st.info("No EOD values yet.")
-    else:
-        st.dataframe(eod_df, use_container_width=True)
-        sels = st.multiselect("Delete EOD rows (by date)", eod_df["d"].tolist())
-        if st.button("🗑 Delete selected EOD"):
-            delete_eod(ticker, sels)
-            st.success("Deleted.")
-            st.rerun()
-
-# --------------- METRICS & CHARTS ------------------
-st.subheader(f"4) Metrics & charts — {ticker}")
-daily = compute_daily(buys_df, eod_df)
-
-if daily.empty:
-    st.info("Add a buy to see analytics.")
+st.divider()
+st.markdown(f"### 2) Manage entries — {ticker}")
+if df.empty:
+    st.info("No entries for this ticker yet.")
 else:
-    # Ensure portfolio_value column is always computed
-    est_val = (daily["cum_shares"] * 
-               (daily["price"].replace(0, np.nan).ffill().bfill().fillna(1.0))).round(2)
-    if "eod_value" in daily.columns:
-        daily["portfolio_value"] = np.where(daily["eod_value"].notna() & (daily["eod_value"] > 0),
-                                            daily["eod_value"], est_val)
-    else:
-        daily["portfolio_value"] = est_val
+    # Show table with ability to select & delete
+    df_disp = df.copy()
+    df_disp["shares (lot)"] = (df_disp["amount"] / df_disp["price"]).round(5)
+    df_disp = df_disp[["id","date","amount","price","shares (lot)"]]
+    df_disp = df_disp.rename(columns={"id":"_id"})
+    st.dataframe(df_disp.drop(columns=["_id"]), use_container_width=True, hide_index=True)
+    ids = st.multiselect("Select rows to delete", options=df_disp["_id"].tolist(), format_func=lambda x: f"Row #{df_disp.index[df_disp['_id']==x][0]+1}")
+    del_cols = st.columns([1,3,1,1])
+    with del_cols[3]:
+        if st.button("🗑️ Delete selected"):
+            delete_ids(ids)
+            st.success("Deleted.")
+            st.experimental_rerun()
 
-    # Manual override for the latest row
-    manual = st.number_input("Manual current value (override last row, optional)", 
-                             min_value=0.0, value=0.0, step=0.01)
-    if manual > 0 and len(daily) > 0:
-        i = daily.index[-1]
-        daily.at[i, "portfolio_value"] = round(manual, 2)
-        # Recompute P&L for that row
-        prev_val = daily.at[daily.index[-2], "portfolio_value"] if len(daily) > 1 else 0.0
-        amt_today = daily.at[i, "amount"]
-        daily.at[i, "daily_pnl"] = round(manual - prev_val - amt_today, 2)
-        daily.at[i, "cum_pnl"] = round(manual - daily.at[i, "cum_invested"], 2)
-        daily.at[i, "ret%"] = round(
-            (daily.at[i, "cum_pnl"] / daily.at[i, "cum_invested"] * 100) if daily.at[i, "cum_invested"] else 0.0,
-            2
+# Current price input (per ticker)
+st.divider()
+st.markdown(f"### 3) Current price — {ticker}")
+default_px = df["price"].iloc[-1] if not df.empty else 75.0
+cur_price = D(st.number_input(f"Current price for {ticker} ($)", value=float(default_px), step=0.01))
+
+# Metrics & charts using precise math
+st.divider()
+st.markdown(f"### 4) Metrics & charts — {ticker}")
+
+lots = compute_lots(df)
+metrics = calc_metrics(lots, cur_price)
+
+colA, colB, colC, colD, colE = st.columns(5)
+colA.metric("Cost basis", f"${metrics['cost_basis']:,.2f}")
+colB.metric("Shares", f"{metrics['shares']:.5f}")
+colC.metric("Portfolio value", f"${metrics['value']:,.2f}")
+colD.metric("Cumulative P&L", f"${metrics['cum_pnl']:,.2f}")
+colE.metric("Return", f"{metrics['ret_pct']}%")
+
+if not metrics["series"].empty:
+    cL, cR = st.columns(2)
+    with cL:
+        st.line_chart(
+            metrics["series"].set_index("date")[["portfolio_value"]],
+            height=260,
+            use_container_width=True
+        )
+    with cR:
+        st.bar_chart(
+            metrics["series"].set_index("date")[["daily_market_move"]],
+            height=260,
+            use_container_width=True
         )
 
-    # --- Top metrics (always from last row) ---
-    latest = daily.iloc[-1]
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Cost basis", f"${latest['cum_invested']:,.2f}")
-    m2.metric("Shares", f"{latest['cum_shares']:.6f}")
-    m3.metric("Portfolio value", f"${latest['portfolio_value']:,.2f}")
-    m4.metric("Cumulative P&L", f"${latest['cum_pnl']:,.2f}")
-    m5.metric("Return", f"{latest['ret%']:.2f}%")
+st.markdown("#### Last 30 days")
+if not lots.empty:
+    recent = metrics["series"].merge(
+        lots[["date","amount","price","shares_lot","cum_shares","cum_invested"]],
+        on="date",
+        how="left"
+    ).tail(30)
+    recent = recent.rename(columns={
+        "shares_lot":"shares",
+        "daily_market_move":"day P&L (market)",
+        "portfolio_value":"value"
+    })
+    st.dataframe(recent, use_container_width=True, hide_index=True)
 
-    # --- Charts ---
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Portfolio value over time**")
-        st.line_chart(daily.set_index("date")[["portfolio_value"]])
-    with c2:
-        st.markdown("**Daily P&L ($)**")
-        st.bar_chart(daily.set_index("date")[["daily_pnl"]])
+# ---------- Positions (All tickers) ----------
+st.divider()
+st.markdown("### 5) Positions — all tickers")
 
-    st.markdown("**Last 30 days**")
-    view = daily.tail(30).copy()
-    view["date"] = view["date"].astype(str)
-    st.dataframe(view, use_container_width=True)
+all_buys = load_buys(None)
+if all_buys.empty:
+    st.info("No buys yet.")
+else:
+    # build price map inputs per ticker
+    tickers_all = sorted(all_buys["ticker"].unique())
+    st.caption("Set the current price for each ticker (defaults to last buy price).")
+    cols = st.columns(min(4, len(tickers_all))) + st.columns(max(0, len(tickers_all)-4))
+    price_map: dict[str, Decimal] = {}
+    for i, tkr in enumerate(tickers_all):
+        last_px = float(all_buys.loc[all_buys["ticker"] == tkr, "price"].iloc[-1])
+        with cols[i]:
+            price_map[tkr] = D(st.number_input(f"{tkr} price", value=last_px, step=0.01, key=f"px_{tkr}"))
+
+    pos = summarize_positions(all_buys, price_map)
+    if not pos.empty:
+        pos["cost_basis"] = pos["cost_basis"].round(2)
+        pos["value"] = pos["value"].round(2)
+        pos["pnl"] = pos["pnl"].round(2)
+        total_row = pd.DataFrame([{
+            "ticker":"TOTAL",
+            "cost_basis": pos["cost_basis"].sum().round(2),
+            "shares": float(Decimal(str(pos["shares"].sum())).quantize(SHARE_Q, ROUND_HALF_UP)),
+            "price": float("nan"),
+            "value": pos["value"].sum().round(2),
+            "pnl": pos["pnl"].sum().round(2),
+            "ret_pct": (pos["pnl"].sum() / pos["cost_basis"].sum() * 100).round(2) if pos["cost_basis"].sum() > 0 else 0.00
+        }])
+        pos_show = pd.concat([pos, total_row], ignore_index=True)
+        st.dataframe(pos_show, use_container_width=True, hide_index=True)
+    else:
+        st.info("No positions yet.")
+
+st.caption("Tip: To match your broker to the cent, type the broker's live price into the Current price boxes.")
