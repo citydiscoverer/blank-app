@@ -1,4 +1,4 @@
-st.set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
+set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
 import pandas as pd
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP, getcontext
