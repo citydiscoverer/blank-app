@@ -219,6 +219,32 @@ daily = compute_daily(buys_df, eod_df)
 if daily.empty:
     st.info("Add a buy to see analytics.")
 else:
+    # Ensure portfolio_value column is always computed
+    est_val = (daily["cum_shares"] * 
+               (daily["price"].replace(0, np.nan).ffill().bfill().fillna(1.0))).round(2)
+    if "eod_value" in daily.columns:
+        daily["portfolio_value"] = np.where(daily["eod_value"].notna() & (daily["eod_value"] > 0),
+                                            daily["eod_value"], est_val)
+    else:
+        daily["portfolio_value"] = est_val
+
+    # Manual override for the latest row
+    manual = st.number_input("Manual current value (override last row, optional)", 
+                             min_value=0.0, value=0.0, step=0.01)
+    if manual > 0 and len(daily) > 0:
+        i = daily.index[-1]
+        daily.at[i, "portfolio_value"] = round(manual, 2)
+        # Recompute P&L for that row
+        prev_val = daily.at[daily.index[-2], "portfolio_value"] if len(daily) > 1 else 0.0
+        amt_today = daily.at[i, "amount"]
+        daily.at[i, "daily_pnl"] = round(manual - prev_val - amt_today, 2)
+        daily.at[i, "cum_pnl"] = round(manual - daily.at[i, "cum_invested"], 2)
+        daily.at[i, "ret%"] = round(
+            (daily.at[i, "cum_pnl"] / daily.at[i, "cum_invested"] * 100) if daily.at[i, "cum_invested"] else 0.0,
+            2
+        )
+
+    # --- Top metrics (always from last row) ---
     latest = daily.iloc[-1]
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Cost basis", f"${latest['cum_invested']:,.2f}")
@@ -227,6 +253,7 @@ else:
     m4.metric("Cumulative P&L", f"${latest['cum_pnl']:,.2f}")
     m5.metric("Return", f"{latest['ret%']:.2f}%")
 
+    # --- Charts ---
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Portfolio value over time**")
