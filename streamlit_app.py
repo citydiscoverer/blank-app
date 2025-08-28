@@ -5,25 +5,25 @@ import pandas as pd
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 
+st.set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
+
 # ---------- Precision / rounding ----------
 getcontext().prec = 28
-SHARE_Q = Decimal("0.00001")  # broker-like 5-decimal shares
+SHARE_Q = Decimal("0.00001")
 CENT    = Decimal("0.01")
-def D(x):  # safe Decimal
-    return Decimal(str(x)) if x is not None and str(x) != "" else Decimal("0")
+def D(x): return Decimal(str(x)) if x is not None and str(x) != "" else Decimal("0")
 
 # ---------- Supabase client ----------
 @st.cache_resource(show_spinner=False)
 def get_supabase():
     try:
         from supabase import create_client
-    except Exception:
-        st.error("Supabase client not installed. Add `supabase` to requirements.txt.")
+    except Exception as e:
+        st.error(f"Supabase client not installed or failed to import: {e}")
         return None
-
     try:
         url = st.secrets["supabase"]["url"]
-        key = st.secrets["supabase"]["service_role_key"]  # <-- use service_role_key (be mindful of security!)
+        key = st.secrets["supabase"]["service_role_key"]
         return create_client(url, key)
     except KeyError:
         st.error('Supabase secrets missing. Add in Secrets:\n[supabase]\nurl="..."\nservice_role_key="..."')
@@ -31,6 +31,9 @@ def get_supabase():
     except Exception as e:
         st.error(f"Supabase init error: {e}")
         return None
+
+sb = get_supabase()
+# ... rest of your app ...
 
 # create global client for helpers
 sb = get_supabase()
