@@ -1,7 +1,6 @@
 # Felix Abayomi – DCA Dashboard (Supabase + Multi-Ticker, Stable + Correct P&L)
 # streamlit_app.py
-import os
-import math
+import os, math
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -21,8 +20,8 @@ st.title("📈 Felix Abayomi – Multi-Ticker DCA (Cloud-saved + EOD)")
 # ======================================================
 #                 DATA BACKENDS (DB / CSV)
 # ======================================================
-BUYS_TABLE = "buys"   # id, ticker, trade_date, amount, price
-EOD_TABLE  = "eod"    # id, ticker, eod_date, eod_value
+BUYS_TABLE = "buys"           # id, ticker, trade_date, amount, price
+EOD_FALLBACK_CSV = "local_eod.csv"
 
 class StoreBase:
     # buys
@@ -31,18 +30,75 @@ class StoreBase:
     def insert_buy(self, ticker: str, d: date, amount: Decimal, price: Decimal) -> None: ...
     def delete_ids(self, ids: List[Any]) -> None: ...
     def clear_ticker(self, ticker: str) -> None: ...
-    def load_all_raw(self) -> pd.DataFrame: ...
+    def load_all_buys_raw(self) -> pd.DataFrame: ...
     # eod
     def load_eod(self, ticker: str) -> pd.DataFrame: ...
     def upsert_eod(self, ticker: str, d: date, value: Decimal) -> None: ...
     def delete_eod(self, ticker: str, dates: List[date]) -> None: ...
+    def load_all_eod_raw(self) -> pd.DataFrame: ...
 
-# -------- Supabase backend --------
-class StoreSupabase(StoreBase):
-    def __init__(self, client):
-        self.sb = client
+# -------- Local CSV EOD helper --------
+def ensure_eod_csv_exists(path=EOD_FALLBACK_CSV):
+    if not os.path.exists(path):
+        pd.DataFrame(columns=["id","ticker","eod_date","eod_value"]).to_csv(path, index=False)
 
-    # buys
+def eod_csv_read(path=EOD_FALLBACK_CSV) -> pd.DataFrame:
+    ensure_eod_csv_exists(path)
+    df = pd.read_csv(path)
+    return df
+
+def eod_csv_write(df: pd.DataFrame, path=EOD_FALLBACK_CSV):
+    df.to_csv(path, index=False)
+
+# -------- Supabase backend (buys) + hybrid EOD --------
+class StoreHybrid(StoreBase):
+    """
+    - Buys: Supabase
+    - EOD: Supabase if we can detect table/columns; otherwise CSV fallback
+    """
+    def __init__(self, sb_client):
+        self.sb = sb_client
+        # Try to detect an EOD table/columns in Supabase
+        self.eod_ready = False
+        self.eod_table = None
+        self.eod_date_col = None
+        self.eod_value_col = None
+        if self.sb:
+            self._detect_eod_table()
+
+    # ---------- EOD schema auto-detect ----------
+    def _detect_eod_table(self):
+        candidates = ["eod", "eod_values"]
+        date_candidates = ["eod_date", "trade_date", "d", "date"]
+        value_candidates = ["eod_value", "value", "val", "close", "portfolio_value"]
+
+        for t in candidates:
+            try:
+                # limit 1 works even if table is empty; PostgREST returns [] with 200
+                res = self.sb.table(t).select("*").limit(1).execute()
+                keys = set(res.data[0].keys()) if (res.data and len(res.data) > 0) else set()
+                # If empty, we still guess defaults and try an order to confirm; if it fails, we continue
+                dcol = next((k for k in date_candidates if k in keys), None) or "eod_date"
+                vcol = next((k for k in value_candidates if k in keys), None) or "eod_value"
+                # Try a harmless ordered select to validate column name exists
+                try:
+                    _ = self.sb.table(t).select("*").order(dcol).limit(1).execute()
+                    self.eod_table, self.eod_date_col, self.eod_value_col = t, dcol, vcol
+                    self.eod_ready = True
+                    return
+                except Exception:
+                    # try without order to allow non-existent dcol
+                    _ = self.sb.table(t).select("*").limit(1).execute()
+                    # still accept, but keep guessed cols; upsert will work if columns exist
+                    self.eod_table, self.eod_date_col, self.eod_value_col = t, dcol, vcol
+                    self.eod_ready = True
+                    return
+            except Exception:
+                continue
+        # nothing detected
+        self.eod_ready = False
+
+    # ---------- buys ----------
     def list_tickers(self) -> List[str]:
         res = self.sb.table(BUYS_TABLE).select("ticker").execute()
         return sorted({row["ticker"] for row in (res.data or [])})
@@ -73,98 +129,55 @@ class StoreSupabase(StoreBase):
 
     def clear_ticker(self, ticker: str) -> None:
         self.sb.table(BUYS_TABLE).delete().eq("ticker", ticker).execute()
-        self.sb.table(EOD_TABLE).delete().eq("ticker", ticker).execute()
+        if self.eod_ready:
+            self.sb.table(self.eod_table).delete().eq("ticker", ticker).execute()
+        else:
+            # CSV fallback cleanup
+            df = eod_csv_read()
+            df = df[df["ticker"] != ticker]
+            eod_csv_write(df)
 
-    def load_all_raw(self) -> pd.DataFrame:
+    def load_all_buys_raw(self) -> pd.DataFrame:
         res = self.sb.table(BUYS_TABLE).select("*").order("ticker").order("trade_date").execute()
         return pd.DataFrame(res.data or [])
 
-    # eod
+    # ---------- EOD (Supabase or CSV fallback) ----------
     def load_eod(self, ticker: str) -> pd.DataFrame:
-        res = self.sb.table(EOD_TABLE).select("*").eq("ticker", ticker).order("eod_date").execute()
-        df = pd.DataFrame(res.data or [])
+        if self.eod_ready:
+            try:
+                res = self.sb.table(self.eod_table).select("*").eq("ticker", ticker).execute()
+                df = pd.DataFrame(res.data or [])
+                if df.empty: return df
+                # normalize to eod_date/eod_value
+                if self.eod_date_col != "eod_date":
+                    df = df.rename(columns={self.eod_date_col: "eod_date"})
+                if self.eod_value_col != "eod_value":
+                    df = df.rename(columns={self.eod_value_col: "eod_value"})
+                df["eod_date"] = pd.to_datetime(df["eod_date"]).dt.date
+                df["eod_value"] = df["eod_value"].astype(float)
+                return df[["ticker","eod_date","eod_value"]]
+            except Exception:
+                pass  # fall through to CSV
+        # CSV fallback
+        df = eod_csv_read()
+        df = df[df["ticker"] == ticker].copy()
         if df.empty: return df
         df["eod_date"] = pd.to_datetime(df["eod_date"]).dt.date
         df["eod_value"] = df["eod_value"].astype(float)
         return df
 
     def upsert_eod(self, ticker: str, d: date, value: Decimal) -> None:
-        self.sb.table(EOD_TABLE).upsert({
-            "ticker": ticker.upper().strip(),
-            "eod_date": d.isoformat(),
-            "eod_value": float(value),
-        }, on_conflict="ticker,eod_date").execute()
-
-    def delete_eod(self, ticker: str, dates: List[date]) -> None:
-        if not dates: return
-        self.sb.table(EOD_TABLE).delete().eq("ticker", ticker).in_("eod_date", [d.isoformat() for d in dates]).execute()
-
-# -------- Local CSV fallback backend --------
-class StoreCSV(StoreBase):
-    def __init__(self, buys_path="local_buys.csv", eod_path="local_eod.csv"):
-        self.buys_path = buys_path
-        self.eod_path  = eod_path
-        if not os.path.exists(self.buys_path):
-            pd.DataFrame(columns=["id","ticker","trade_date","amount","price"]).to_csv(self.buys_path, index=False)
-        if not os.path.exists(self.eod_path):
-            pd.DataFrame(columns=["id","ticker","eod_date","eod_value"]).to_csv(self.eod_path, index=False)
-
-    # internal helpers
-    def _read_buys(self): return pd.read_csv(self.buys_path)
-    def _write_buys(self, df): df.to_csv(self.buys_path, index=False)
-    def _read_eod(self):  return pd.read_csv(self.eod_path)
-    def _write_eod(self, df): df.to_csv(self.eod_path, index=False)
-
-    # buys
-    def list_tickers(self) -> List[str]:
-        df = self._read_buys()
-        return sorted(df["ticker"].dropna().unique().tolist()) if not df.empty else []
-
-    def load_buys(self, ticker: Optional[str]) -> pd.DataFrame:
-        df = self._read_buys()
-        if df.empty: return df
-        if ticker: df = df[df["ticker"] == ticker]
-        df = df.rename(columns={"trade_date": "date"})
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df.astype({"amount":float,"price":float})
-
-    def insert_buy(self, ticker: str, d: date, amount: Decimal, price: Decimal) -> None:
-        df = self._read_buys()
-        new_id = (df["id"].max() + 1) if not df.empty else 1
-        row = {"id": new_id, "ticker": ticker.upper().strip(),
-               "trade_date": d.isoformat(), "amount": float(amount), "price": float(price)}
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        self._write_buys(df)
-
-    def delete_ids(self, ids: List[Any]) -> None:
-        if not ids: return
-        df = self._read_buys()
-        df = df[~df["id"].isin(ids)]
-        self._write_buys(df)
-
-    def clear_ticker(self, ticker: str) -> None:
-        dfb = self._read_buys()
-        dfe = self._read_eod()
-        dfb = dfb[dfb["ticker"] != ticker]
-        dfe = dfe[dfe["ticker"] != ticker]
-        self._write_buys(dfb)
-        self._write_eod(dfe)
-
-    def load_all_raw(self) -> pd.DataFrame:
-        return self._read_buys()
-
-    # eod
-    def load_eod(self, ticker: str) -> pd.DataFrame:
-        df = self._read_eod()
-        if df.empty: return df
-        df = df[df["ticker"] == ticker]
-        if df.empty: return df
-        df["eod_date"] = pd.to_datetime(df["eod_date"]).dt.date
-        df["eod_value"] = df["eod_value"].astype(float)
-        return df
-
-    def upsert_eod(self, ticker: str, d: date, value: Decimal) -> None:
-        df = self._read_eod()
+        if self.eod_ready:
+            body = {"ticker": ticker.upper().strip(),
+                    self.eod_date_col: d.isoformat(),
+                    self.eod_value_col: float(value)}
+            try:
+                self.sb.table(self.eod_table).upsert(body, on_conflict=f"ticker,{self.eod_date_col}").execute()
+                return
+            except Exception:
+                pass  # fall through to CSV
+        # CSV fallback
+        df = eod_csv_read()
         mask = (df["ticker"] == ticker) & (pd.to_datetime(df["eod_date"]).dt.date == d)
         if mask.any():
             df.loc[mask, "eod_value"] = float(value)
@@ -172,13 +185,36 @@ class StoreCSV(StoreBase):
             new_id = (df["id"].max() + 1) if not df.empty else 1
             row = {"id": new_id, "ticker": ticker, "eod_date": d.isoformat(), "eod_value": float(value)}
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        self._write_eod(df)
+        eod_csv_write(df)
 
     def delete_eod(self, ticker: str, dates: List[date]) -> None:
         if not dates: return
-        df = self._read_eod()
+        if self.eod_ready:
+            try:
+                self.sb.table(self.eod_table).delete().eq("ticker", ticker).in_(self.eod_date_col, [d.isoformat() for d in dates]).execute()
+                return
+            except Exception:
+                pass
+        # CSV fallback
+        df = eod_csv_read()
         keep = ~((df["ticker"] == ticker) & (df["eod_date"].isin([d.isoformat() for d in dates])))
-        self._write_eod(df[keep])
+        eod_csv_write(df[keep])
+
+    def load_all_eod_raw(self) -> pd.DataFrame:
+        if self.eod_ready:
+            try:
+                res = self.sb.table(self.eod_table).select("*").order("ticker").execute()
+                df = pd.DataFrame(res.data or [])
+                if df.empty: return df
+                if self.eod_date_col != "eod_date":
+                    df = df.rename(columns={self.eod_date_col: "eod_date"})
+                if self.eod_value_col != "eod_value":
+                    df = df.rename(columns={self.eod_value_col: "eod_value"})
+                return df[["ticker","eod_date","eod_value"]]
+            except Exception:
+                pass
+        # CSV fallback
+        return eod_csv_read()
 
 # ======================================================
 #               CONNECT TO SUPABASE (SAFE)
@@ -201,8 +237,8 @@ def get_supabase_client():
         return None
 
 sb_client = get_supabase_client()
-store: StoreBase = StoreSupabase(sb_client) if sb_client else StoreCSV()
-connected = isinstance(store, StoreSupabase)
+store: StoreBase = StoreHybrid(sb_client) if sb_client else StoreHybrid(None)
+connected = sb_client is not None
 
 # ======================================================
 #                     CALCULATIONS
@@ -212,72 +248,59 @@ def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame) -> pd.DataFrame:
     Returns daily table with:
       date, amount, price, shares, cum_shares, cum_invested, portfolio_value, daily_pnl, cum_pnl, ret%
     Uses EOD value when available; otherwise estimates using last known non-zero price * cum_shares.
-    Daily P&L isolates market move: Δ(value) − today_contribution.
+    Daily P&L isolates market move: Δ(value) − today_contribution. First day P&L = 0.
     """
-    if buys.empty and eod.empty:
+    if buys.empty and (eod is None or eod.empty):
         return pd.DataFrame(columns=["date","amount","price","shares","cum_shares","cum_invested",
                                      "portfolio_value","daily_pnl","cum_pnl","ret%"])
-    b = buys.copy()
-    if not b.empty:
-        b["shares"] = (b["amount"]/b["price"]).round(5)  # display
-        b_agg = b.groupby("date", as_index=False).agg(amount=("amount","sum"), price=("price","mean"))
-        b_agg["shares"] = (b_agg["amount"]/b_agg["price"]).round(5)
-    else:
-        b_agg = pd.DataFrame(columns=["date","amount","price","shares"])
 
-    e = eod.copy().rename(columns={"eod_date":"date"}) if not eod.empty else pd.DataFrame(columns=["date","eod_value"])
+    b_agg = (buys.groupby("date", as_index=False)
+                  .agg(amount=("amount","sum"), price=("price","mean"))) if not buys.empty else pd.DataFrame(columns=["date","amount","price"])
+    b_agg["shares"] = (b_agg["amount"].fillna(0.0) / b_agg["price"].replace(0, pd.NA)).fillna(0.0).round(5)
+
+    e = eod.copy() if (eod is not None and not eod.empty) else pd.DataFrame(columns=["eod_date","eod_value"])
+    if not e.empty and "date" not in e.columns:
+        e = e.rename(columns={"eod_date":"date"})
+    if not e.empty:
+        e["date"] = pd.to_datetime(e["date"]).dt.date
 
     # Build timeline
-    dates = []
-    if not b_agg.empty: dates.append(min(b_agg["date"]))
-    if not e.empty:     dates.append(min(e["date"]))
-    start = min(dates) if dates else date.today()
+    candidates = []
+    if not b_agg.empty: candidates.append(b_agg["date"].min())
+    if not e.empty:     candidates.append(e["date"].min())
+    start = min(candidates) if candidates else date.today()
     end   = date.today()
     t = pd.DataFrame({"date": pd.date_range(start, end, freq="D").date})
 
     # Merge
     t = t.merge(b_agg, how="left", on="date")
-    t = t.merge(e,     how="left", on="date")
+    t = t.merge(e[["date","eod_value"]] if not e.empty else pd.DataFrame(columns=["date","eod_value"]), how="left", on="date")
     for col in ["amount","price","shares","eod_value"]:
         if col not in t.columns: t[col] = 0.0
         t[col] = t[col].fillna(0.0)
 
-    # Cum totals (shares as Decimal with 5dp)
-    shares_lotD = t["shares"].apply(D)
-    t["cum_shares"]   = shares_lotD.cumsum().astype(float)
+    # Cum totals
     t["cum_invested"] = t["amount"].cumsum().round(2)
+    t["cum_shares"]   = t["shares"].cumsum().round(5)
 
-    # Proxy price for estimate (last non-zero)
+    # Estimate when no EOD
     proxy = t["price"].replace(0, pd.NA).ffill().bfill().fillna(1.0)
     est_value = (t["cum_shares"] * proxy).round(2)
     t["portfolio_value"] = t["eod_value"].where(t["eod_value"] > 0, est_value)
 
-    # Daily P&L (market move only)
+    # Daily P&L
     change = t["portfolio_value"].diff().fillna(0.0)
+    t.loc[t.index[0], "amount"] = t.loc[t.index[0], "amount"]  # keep as is
     t["daily_pnl"] = (change - t["amount"]).round(2)
+    if len(t) > 0: t.loc[t.index[0], "daily_pnl"] = 0.00
 
     t["cum_pnl"] = (t["portfolio_value"] - t["cum_invested"]).round(2)
     t["ret%"] = (t["cum_pnl"]/t["cum_invested"]*100).replace([pd.NA, float("inf"), -float("inf")], 0).fillna(0).round(2)
 
-    # Display shares (lot) for the day, and cum_shares
-    t["shares"] = t["shares"].round(5)
-    t["cum_shares"] = t["cum_shares"].round(5)
+    # Clean display
+    t["amount"] = t["amount"].round(2)
+    t["price"]  = t["price"].round(4)
     return t[["date","amount","price","shares","cum_shares","cum_invested","portfolio_value","daily_pnl","cum_pnl","ret%"]]
-
-def compute_lots(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df.assign(shares_lot=[], cum_shares=[], cum_invested=[])
-    tmp = df.copy().sort_values("date")
-    tmp["amountD"] = tmp["amount"].apply(D)
-    tmp["priceD"]  = tmp["price"].apply(D)
-    tmp["shares_lotD"]   = (tmp["amountD"] / tmp["priceD"]).apply(lambda s: s.quantize(SHARE_Q, ROUND_HALF_UP))
-    tmp["cum_sharesD"]   = tmp["shares_lotD"].cumsum()
-    tmp["cum_investedD"] = tmp["amountD"].cumsum()
-    out = tmp.copy()
-    out["shares_lot"]   = out["shares_lotD"].astype(float)
-    out["cum_shares"]   = out["cum_sharesD"].astype(float)
-    out["cum_invested"] = out["cum_investedD"].astype(float)
-    return out
 
 def calc_metrics_from_daily(daily: pd.DataFrame):
     if daily.empty:
@@ -291,51 +314,16 @@ def calc_metrics_from_daily(daily: pd.DataFrame):
         "ret_pct": float(last["ret%"]),
     }
 
-def summarize_positions(all_buys: pd.DataFrame, all_eod: pd.DataFrame, price_map: Dict[str, Decimal]) -> pd.DataFrame:
-    if all_buys.empty: return pd.DataFrame()
-    rows = []
-    for tkr, grp in all_buys.groupby("ticker"):
-        grp2 = grp.rename(columns={"trade_date":"date"}) if "trade_date" in grp.columns else grp
-        grp2["date"] = pd.to_datetime(grp2["date"]).dt.date
-        eod_t = all_eod[all_eod["ticker"] == tkr].copy() if not all_eod.empty else pd.DataFrame(columns=["ticker","eod_date","eod_value"])
-        daily = compute_daily(grp2.astype({"amount":float,"price":float}), eod_t.rename(columns={"eod_date":"date"}))
-        met = calc_metrics_from_daily(daily)
-        rows.append({
-            "ticker": tkr,
-            "cost_basis": round(met["cost_basis"], 2),
-            "shares": round(met["shares"], 5),
-            "value": round(met["value"], 2),
-            "pnl": round(met["cum_pnl"], 2),
-            "ret_pct": round(met["ret_pct"], 2),
-        })
-    dfp = pd.DataFrame(rows)
-    if dfp.empty: return dfp
-    tot_cost = dfp["cost_basis"].sum()
-    tot_val  = dfp["value"].sum()
-    tot_pnl  = dfp["pnl"].sum()
-    tot_ret  = round((tot_pnl / tot_cost * 100), 2) if tot_cost > 0 else 0.00
-    total_row = pd.DataFrame([{
-        "ticker": "TOTAL",
-        "cost_basis": round(tot_cost, 2),
-        "shares": float(Decimal(str(dfp["shares"].sum())).quantize(SHARE_Q, ROUND_HALF_UP)),
-        "value": round(tot_val, 2),
-        "pnl": round(tot_pnl, 2),
-        "ret_pct": tot_ret,
-    }])
-    return pd.concat([dfp.sort_values("ticker"), total_row], ignore_index=True)
-
 # ======================================================
 #                          UI
 # ======================================================
 with st.sidebar:
     st.subheader("☁️ Data source")
-    if connected:
-        st.success("Supabase: Connected")
-    else:
-        st.warning("Supabase NOT set → using local CSV")
-        st.caption("Add secrets/env vars to enable cloud saving.")
+    st.success("Supabase: Connected") if connected else st.warning("Supabase NOT set → using local CSV for EOD")
+    st.caption("Tip: Add correct Supabase secrets to persist EOD in cloud.")
 
-existing = store.list_tickers()
+# Ticker picker
+existing = store.list_tickers() if connected else []
 defaults = ["SPLG", "SCHD", "VOO", "SPY"]
 picker_opts = sorted(set(existing + defaults)) if existing else defaults
 default_tkr = "SPLG" if "SPLG" in picker_opts else picker_opts[0]
@@ -360,7 +348,11 @@ with ac3:
 with ac4:
     st.write(" ")
     if st.button("➕ Add entry", use_container_width=True):
-        store.insert_buy(ticker, d, amt, px); st.success("Added."); st.rerun()
+        if connected:
+            store.insert_buy(ticker, d, amt, px); st.success("Added."); st.rerun()
+        else:
+            # If not connected, you likely created buys in Supabase earlier—warn:
+            st.error("Supabase not connected. Configure secrets to save buys to cloud.")
 
 # ---- Add EOD value ----
 st.markdown("### 2) Add broker end-of-day (EOD) value")
@@ -372,13 +364,10 @@ with e2:
 with e3:
     st.write(" ")
     if st.button("💾 Save EOD value", use_container_width=True):
-        if v_eod <= 0:
-            st.warning("Enter the exact EOD value from your brokerage (e.g., 24.90, 50.11).")
-        else:
-            store.upsert_eod(ticker, d_eod, v_eod); st.success("EOD saved."); st.rerun()
+        store.upsert_eod(ticker, d_eod, v_eod); st.success("EOD saved."); st.rerun()
 
 # ---- Manage entries ----
-buys_df = store.load_buys(ticker)
+buys_df = store.load_buys(ticker) if connected else pd.DataFrame()
 eod_df  = store.load_eod(ticker)
 
 st.divider()
@@ -401,7 +390,7 @@ with colL:
 
 with colR:
     st.markdown("**EOD values**")
-    if eod_df.empty:
+    if eod_df is None or eod_df.empty:
         st.info("No EOD values yet.")
     else:
         st.dataframe(eod_df.rename(columns={"eod_date":"date"}), use_container_width=True, hide_index=True)
@@ -412,7 +401,8 @@ with colR:
 # ---- Metrics & charts (EOD-aware) ----
 st.divider()
 st.markdown(f"### 4) Metrics & charts — {ticker}")
-daily = compute_daily(buys_df.astype({"amount":float,"price":float}), eod_df.copy())
+daily = compute_daily(buys_df.astype({"amount":float,"price":float}) if not buys_df.empty else pd.DataFrame(),
+                      eod_df.copy() if (eod_df is not None and not eod_df.empty) else pd.DataFrame())
 if daily.empty:
     st.info("Add a buy to see analytics.")
 else:
@@ -438,41 +428,67 @@ else:
 # ---- Positions ticket (ALL tickers) ----
 st.divider()
 st.markdown("### 5) Positions — all tickers")
-all_buys_raw = store.load_all_raw()
-all_eod_raw  = pd.DataFrame()
-if connected:
-    # load raw eod for all tickers from Supabase
-    try:
-        res_all_eod = sb_client.table(EOD_TABLE).select("*").order("ticker").order("eod_date").execute()
-        all_eod_raw = pd.DataFrame(res_all_eod.data or [])
-    except Exception:
-        all_eod_raw = pd.DataFrame()
-else:
-    # from CSV fallback
-    if os.path.exists("local_eod.csv"):
-        all_eod_raw = pd.read_csv("local_eod.csv")
+all_buys_raw = store.load_all_buys_raw() if connected else pd.DataFrame()
+all_eod_raw  = store.load_all_eod_raw()
 
 if all_buys_raw is None or all_buys_raw.empty:
     st.info("No buys yet.")
 else:
     tickers_all = sorted(all_buys_raw["ticker"].unique())
-    st.caption("Set current price for each ticker only if you want to estimate days without EOD (optional).")
-    # Build a responsive grid (avoid columns(0) crash)
+    st.caption("Enter an estimated price only if you want to estimate days without EOD (optional).")
+
+    # Responsive grid for price inputs (avoid columns(0) crash)
     price_map: Dict[str, Decimal] = {}
     if tickers_all:
         per_row = 4
         rows = math.ceil(len(tickers_all)/per_row)
         idx = 0
         for _ in range(rows):
-            cols = st.columns(min(per_row, len(tickers_all)-idx))
+            ncols = min(per_row, len(tickers_all)-idx)
+            cols = st.columns(ncols) if ncols > 0 else []
             for c in cols:
                 if idx >= len(tickers_all): break
                 tkr = tickers_all[idx]
                 last_px = float(all_buys_raw.loc[all_buys_raw["ticker"] == tkr, "price"].iloc[-1])
                 price_map[tkr] = D(c.number_input(f"{tkr} est. price", value=last_px, step=0.01, key=f"px_{tkr}"))
                 idx += 1
-    # Summarize using EOD when present
+
+    # Summarize positions using EOD when present
+    def summarize_positions(all_buys: pd.DataFrame, all_eod: pd.DataFrame, price_map: Dict[str, Decimal]) -> pd.DataFrame:
+        if all_buys.empty: return pd.DataFrame()
+        rows = []
+        for tkr, grp in all_buys.groupby("ticker"):
+            grp2 = grp.rename(columns={"trade_date":"date"}) if "trade_date" in grp.columns else grp
+            grp2["date"] = pd.to_datetime(grp2["date"]).dt.date
+            eod_t = all_eod[all_eod["ticker"] == tkr].copy() if not all_eod.empty else pd.DataFrame(columns=["ticker","eod_date","eod_value"])
+            eod_t = eod_t.rename(columns={"eod_date":"date"}) if "eod_date" in eod_t.columns else eod_t
+            daily_t = compute_daily(grp2.astype({"amount":float,"price":float}), eod_t)
+            met = calc_metrics_from_daily(daily_t)
+            rows.append({
+                "ticker": tkr,
+                "cost_basis": round(met["cost_basis"], 2),
+                "shares": round(met["shares"], 5),
+                "value": round(met["value"], 2),
+                "pnl": round(met["cum_pnl"], 2),
+                "ret_pct": round(met["ret_pct"], 2),
+            })
+        dfp = pd.DataFrame(rows)
+        if dfp.empty: return dfp
+        tot_cost = dfp["cost_basis"].sum()
+        tot_val  = dfp["value"].sum()
+        tot_pnl  = dfp["pnl"].sum()
+        tot_ret  = round((tot_pnl / tot_cost * 100), 2) if tot_cost > 0 else 0.00
+        total_row = pd.DataFrame([{
+            "ticker": "TOTAL",
+            "cost_basis": round(tot_cost, 2),
+            "shares": float(Decimal(str(dfp["shares"].sum())).quantize(SHARE_Q, ROUND_HALF_UP)),
+            "value": round(tot_val, 2),
+            "pnl": round(tot_pnl, 2),
+            "ret_pct": tot_ret,
+        }])
+        return pd.concat([dfp.sort_values("ticker"), total_row], ignore_index=True)
+
     positions = summarize_positions(all_buys_raw, all_eod_raw, price_map)
     st.dataframe(positions, use_container_width=True, hide_index=True)
 
-st.caption("Tip: enter EOD values daily to match your broker exactly. The app estimates only when EOD is missing.")
+st.caption("Tip: enter EOD values daily to match your broker exactly. App estimates only when EOD is missing.")
