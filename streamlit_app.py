@@ -1,4 +1,4 @@
-set_page_config(page_title="Felix Legacy – Multi-Ticker DCA", layout="wide")
+# Felix Abayomi – DCA Dashboard (Supabase + Multi-Ticker, Stable + Correct P&L)
 import pandas as pd
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP, getcontext
