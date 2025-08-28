@@ -76,29 +76,24 @@ def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame) -> pd.DataFrame:
       portfolio_value, daily_pnl, cum_pnl, ret%
     Rules:
       - shares = amount / price (0 if price is 0)
-      - value uses broker EOD if provided for that date; else estimate = cum_shares * proxy_price
-      - daily P&L = Δ(value) − amount_today (market move only)
-      - first day daily P&L = 0
+      - value uses broker EOD if provided; else estimate = cum_shares * proxy_price
+      - daily P&L = Δ(value) − amount_today (market move only), first day = 0
     """
-    # Handle empty case
     if buys.empty and eod.empty:
         return pd.DataFrame(columns=[
             "date","amount","price","shares","cum_shares","cum_invested",
             "portfolio_value","daily_pnl","cum_pnl","ret%"
         ])
 
-    # Aggregate buys per day
     if not buys.empty:
         b = (buys.groupby("d", as_index=False)
-                  .agg(amount=("amount","sum"), price=("price","mean")))
+                 .agg(amount=("amount","sum"), price=("price","mean")))
         b["shares"] = np.where(b["price"] > 0, b["amount"]/b["price"], 0.0)
     else:
         b = pd.DataFrame(columns=["d","amount","price","shares"])
 
-    # EOD values
     e = eod.copy()[["d","eod_value"]] if not eod.empty else pd.DataFrame(columns=["d","eod_value"])
 
-    # Timeline from first relevant date to today
     starts = []
     if not b.empty: starts.append(min(b["d"]))
     if not e.empty: starts.append(min(e["d"]))
@@ -106,7 +101,6 @@ def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame) -> pd.DataFrame:
     end   = date.today()
     t = pd.DataFrame({"d": pd.date_range(start, end, freq="D").date})
 
-    # Merge
     t = t.merge(b, how="left", on="d")
     t = t.merge(e, how="left", on="d")
     for col in ["amount","price","shares","eod_value"]:
@@ -115,27 +109,22 @@ def compute_daily(buys: pd.DataFrame, eod: pd.DataFrame) -> pd.DataFrame:
         else:
             t[col] = 0.0
 
-    # Cum sums
     t["cum_invested"] = t["amount"].cumsum().round(2)
     t["cum_shares"]   = t["shares"].cumsum().round(6)
 
-    # Value: prefer EOD; else estimate using latest non-zero price proxy
     t["proxy_price"]     = t["price"].replace(0, np.nan).ffill().bfill().fillna(1.0)
     t["est_value"]       = (t["cum_shares"] * t["proxy_price"]).round(2)
     t["portfolio_value"] = np.where(t["eod_value"] > 0, t["eod_value"], t["est_value"])
 
-    # Daily P&L = Δvalue − today's contribution
     t["value_change"] = t["portfolio_value"].diff()
-    t.loc[t.index[0], "value_change"] = 0.0  # no prior day
+    t.loc[t.index[0], "value_change"] = 0.0
     t["daily_pnl"] = (t["value_change"] - t["amount"]).round(2)
 
-    # Cumulative P&L & Return
     t["cum_pnl"] = (t["portfolio_value"] - t["cum_invested"]).round(2)
     t["ret%"]    = np.where(t["cum_invested"] > 0,
                             (t["cum_pnl"]/t["cum_invested"]*100).round(2),
                             0.0)
 
-    # Tidy rounding
     t["amount"]          = t["amount"].round(2)
     t["price"]           = t["price"].round(4)
     t["shares"]          = t["shares"].round(6)
@@ -152,12 +141,12 @@ ticker = st.sidebar.selectbox("Ticker", TICKERS, index=0)
 col_sb1, col_sb2 = st.sidebar.columns(2)
 with col_sb1:
     if st.button("🔄 Refresh data"):
-        st.experimental_rerun()
+        st.rerun()
 with col_sb2:
     if st.button("🧹 Clear THIS ticker"):
         clear_ticker(ticker)
         st.success(f"Cleared all data for {ticker}.")
-        st.experimental_rerun()
+        st.rerun()
 
 # ---------------- LOAD DATA ONCE --------------------
 buys_df = load_buys(ticker)
@@ -177,7 +166,7 @@ with st.form("add_buy_form", clear_on_submit=True):
     if submitted:
         add_buy(ticker, d_in, float(amt), float(px))
         st.success("Buy saved to cloud.")
-        st.experimental_rerun()
+        st.rerun()
 
 # ------------------ ADD EOD (FORM) -----------------
 st.subheader(f"2) Add broker end-of-day (EOD) value for {ticker}")
@@ -194,7 +183,7 @@ with st.form("add_eod_form", clear_on_submit=True):
         else:
             upsert_eod(ticker, d_eod, float(v_eod))
             st.success("EOD saved to cloud.")
-            st.experimental_rerun()
+            st.rerun()
 
 # ------------------ MANAGE ENTRIES -----------------
 st.subheader("3) Manage entries")
@@ -209,7 +198,7 @@ with colL:
         if st.button("🗑 Delete selected buys"):
             delete_buys(ids)
             st.success("Deleted.")
-            st.experimental_rerun()
+            st.rerun()
 
 with colR:
     st.markdown("**EOD values (cloud)**")
@@ -221,7 +210,7 @@ with colR:
         if st.button("🗑 Delete selected EOD"):
             delete_eod(ticker, sels)
             st.success("Deleted.")
-            st.experimental_rerun()
+            st.rerun()
 
 # --------------- METRICS & CHARTS ------------------
 st.subheader(f"4) Metrics & charts — {ticker}")
